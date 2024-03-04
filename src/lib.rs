@@ -6,60 +6,66 @@ use std::{
 
 const BUFFER_SIZE: usize = 8 * 1024;
 
-/// Copy contents of wanted into actual.
-pub fn copy<R: io::Read, P: AsRef<Path>>(mut wanted: R, actual: P) -> io::Result<u64> {
-    let mut actual = OpenOptions::new()
+/// Copy contents of source to dest, only writing to dest once differing bytes are encountered.
+///
+/// Will result in source and est having identical bytes while trying to avoid unnecessary writes.
+/// If differing bytes are encountered, then `io::copy` will be used to write the remaining bytes to dest.
+pub fn copy<R: io::Read, P: AsRef<Path>>(mut source: R, dest: P) -> io::Result<u64> {
+    let mut dest = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(actual)?;
-    let mut wanted_buffer = [0; BUFFER_SIZE];
-    let mut actual_buffer = [0; BUFFER_SIZE];
+        .open(dest)?;
+    let mut source_buffer = [0; BUFFER_SIZE];
+    let mut dest_buffer = [0; BUFFER_SIZE];
     let mut bytes_copied = 0;
     loop {
-        let wanted_read = wanted.read(&mut wanted_buffer)?;
-        if wanted_read == 0 {
+        let source_bytes_read = source.read(&mut source_buffer)?;
+        if source_bytes_read == 0 {
             break;
         }
-        let actual_read = actual.read(&mut actual_buffer)?;
-        match actual_read.cmp(&wanted_read) {
+        let dest_bytes_read = dest.read(&mut dest_buffer)?;
+        match dest_bytes_read.cmp(&source_bytes_read) {
             std::cmp::Ordering::Equal
-                if wanted_buffer[..wanted_read] == actual_buffer[..actual_read] =>
+                if source_buffer[..source_bytes_read] == dest_buffer[..dest_bytes_read] =>
             {
-                bytes_copied += wanted_read as u64;
+                bytes_copied += source_bytes_read as u64;
             }
+            // Content differs
             std::cmp::Ordering::Equal => {
-                // We rewind so that we're back to before the write
-                actual.seek(io::SeekFrom::Current(-(actual_read as i64)))?;
-                actual.write_all(&wanted_buffer[..wanted_read])?;
-                bytes_copied += wanted_read as u64;
-                let copied = io::copy(&mut wanted, &mut actual)?;
+                // Move backwards and write the latest read
+                dest.seek(io::SeekFrom::Current(-(dest_bytes_read as i64)))?;
+                dest.write_all(&source_buffer[..source_bytes_read])?;
+                bytes_copied += source_bytes_read as u64;
+                // Use `io::copy` to write rest of bytes to file
+                let copied = io::copy(&mut source, &mut dest)?;
                 bytes_copied += copied;
                 break;
             }
+            // dest has more bytes than source
             std::cmp::Ordering::Greater => {
-                // actual > wanted => trim actual down to desired size -> have to assume Ok(0) will be next wanted.read return
-                actual.seek(io::SeekFrom::Current(-(actual_read as i64)))?;
-                actual.write_all(&wanted_buffer[..wanted_read])?;
-                bytes_copied += wanted_read as u64;
+                // Move backward and write the latest read
+                dest.seek(io::SeekFrom::Current(-(dest_bytes_read as i64)))?;
+                dest.write_all(&source_buffer[..source_bytes_read])?;
+                bytes_copied += source_bytes_read as u64;
                 break;
             }
+            // source has more bytes than dest
             std::cmp::Ordering::Less => {
-                // actual < wanted => actual is shorter than wanted, append in remaining bytes
-
-                // move back cursor in file to before the read
-                actual.seek(io::SeekFrom::Current(-(actual_read as i64)))?;
-                actual.write_all(&wanted_buffer[..wanted_read])?;
-                bytes_copied += wanted_read as u64;
-                let copied = io::copy(&mut wanted, &mut actual)?;
+                // Move backward and write the latest read
+                dest.seek(io::SeekFrom::Current(-(dest_bytes_read as i64)))?;
+                dest.write_all(&source_buffer[..source_bytes_read])?;
+                bytes_copied += source_bytes_read as u64;
+                // Use `io::copy` to write rest of bytes to file
+                let copied = io::copy(&mut source, &mut dest)?;
                 bytes_copied += copied;
-                // trim shouldn't be needed so we return here
-                return Ok(bytes_copied);
+                break;
             }
         }
     }
 
-    actual.set_len(bytes_copied)?;
+    // Possibly truncate dest to be the same size as source
+    dest.set_len(bytes_copied)?;
 
     Ok(bytes_copied)
 }
